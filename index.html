@@ -94,6 +94,7 @@
   <div id="statusBar">
     <div>状态：<span class="state" id="stateText">未开始</span></div>
     <div>记录点数：<span id="countText">0</span></div>
+    <div>最新坐标：<span id="coordText">—</span></div>
     <div>面积：<span class="area" id="areaText">—</span></div>
   </div>
   <div id="toolbar">
@@ -121,6 +122,7 @@
     const stateText = document.getElementById('stateText');
     const countText = document.getElementById('countText');
     const areaText = document.getElementById('areaText');
+    const coordText = document.getElementById('coordText');
     const btnStart = document.getElementById('btnStart');
     const btnStop = document.getElementById('btnStop');
     const btnClear = document.getElementById('btnClear');
@@ -187,6 +189,7 @@
       if (!isRecording) return; // 未在记录中，不标点
 
       trackPoints.push([lng, lat]);
+      coordText.textContent = lng.toFixed(6) + ', ' + lat.toFixed(6);
 
       try {
         // 标点（小圆点）
@@ -214,9 +217,9 @@
         stateText.textContent = '绘制失败：' + (err && err.message ? err.message : err);
       }
 
-      // 第一个点居中并放大
+      // 记录中地图跟随最新位置
+      map.setCenter([lng, lat]);
       if (trackPoints.length === 1) {
-        map.setCenter([lng, lat]);
         map.setZoom(18);
       }
 
@@ -249,6 +252,7 @@
       markers = [];
       trackPoints = [];
       areaText.textContent = '—';
+      coordText.textContent = '—';
       isRecording = true;
       geolocation.watchPosition();
       updateUI();
@@ -272,7 +276,9 @@
           polygon.setMap(map);
           const area = calcAreaM2(trackPoints);
           areaText.textContent = formatArea(area);
-          try { map.setFitView(); } catch (e) { }
+          try {
+            map.setFitView(markers.concat(polygon ? [polygon] : [], polyline ? [polyline] : []));
+          } catch (e) { }
         } catch (err) {
           stateText.textContent = '绘制失败：' + (err && err.message ? err.message : err);
         }
@@ -289,6 +295,7 @@
       markers = [];
       trackPoints = [];
       areaText.textContent = '—';
+      coordText.textContent = '—';
       isRecording = false;
       updateUI();
     }
