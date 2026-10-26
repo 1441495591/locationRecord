@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="initial-scale=1.0, user-scalable=no, width=device-width" />
+  <title>圈地测量</title>
+  <style>
+    html,
+    body,
+    #container {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    /* 顶部状态栏 */
+    #statusBar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: rgba(255, 255, 255, 0.92);
+      padding: 10px 14px;
+      box-shadow: 0 1px 6px rgba(0, 0, 0, 0.15);
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    #statusBar .state {
+      font-weight: bold;
+      color: #333;
+    }
+
+    #statusBar .area {
+      color: #d35400;
+      font-weight: bold;
+      font-size: 16px;
+    }
+
+    /* 底部按钮栏 */
+    #toolbar {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      display: flex;
+      gap: 12px;
+      padding: 14px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 -1px 6px rgba(0, 0, 0, 0.15);
+    }
+
+    #toolbar button {
+      flex: 1;
+      height: 48px;
+      font-size: 16px;
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      cursor: pointer;
+    }
+
+    #btnStart {
+      background: #07c160;
+    }
+
+    #btnStop {
+      background: #fa5151;
+    }
+
+    #btnClear {
+      background: #888;
+    }
+
+    #toolbar button:disabled {
+      background: #ccc;
+      color: #fff;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="container"></div>
+  <div id="statusBar">
+    <div>状态：<span class="state" id="stateText">未开始</span></div>
+    <div>记录点数：<span id="countText">0</span></div>
+    <div>面积：<span class="area" id="areaText">—</span></div>
+  </div>
+  <div id="toolbar">
+    <button id="btnStart">开始</button>
+    <button id="btnStop" disabled>结束</button>
+    <button id="btnClear" disabled>清除</button>
+  </div>
+
+  <script type="text/javascript">
+    window._AMapSecurityConfig = {
+      securityJsCode: "d25586c01ab1815c95b0b8f0d9771bc0",
+    };
+  </script>
+  <script src="https://webapi.amap.com/loader.js"></script>
+  <script type="text/javascript">
+    let map = null;
+    let geolocation = null;
+    let trackPoints = []; // 坐标数组：[[lng, lat], ...]（GCJ-02）
+    let markers = [];     // 轨迹点标记
+    let polyline = null;  // 轨迹连线
+    let polygon = null;   // 闭合面积多边形
+    let isRecording = false;
+    let initialLocated = false; // 是否已完成初次定位居中
+
+    const stateText = document.getElementById('stateText');
+    const countText = document.getElementById('countText');
+    const areaText = document.getElementById('areaText');
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const btnClear = document.getElementById('btnClear');
+
+    // 计算多边形面积（平方米）
+    function calcAreaM2(coords) {
+      if (!coords || coords.length < 3) return 0;
+      // 优先使用高德内置工具
+      if (window.AMap && AMap.GeometryUtil && typeof AMap.GeometryUtil.ringArea === 'function') {
+        try {
+          const closed = coords.concat([coords[0]]);
+          const a = AMap.GeometryUtil.ringArea(closed);
+          if (typeof a === 'number' && isFinite(a) && a > 0) return a;
+        } catch (e) { }
+      }
+      // fallback：球面 shoelace 公式
+      const R = 6378137, rad = Math.PI / 180;
+      let area = 0, n = coords.length;
+      for (let i = 0; i < n; i++) {
+        const x1 = coords[i][0], y1 = coords[i][1];
+        const x2 = coords[(i + 1) % n][0], y2 = coords[(i + 1) % n][1];
+        area += (x2 - x1) * (2 + Math.sin(y1 * rad) + Math.sin(y2 * rad));
+      }
+      return Math.abs(area) * R * R * rad / 2;
+    }
+
+    function formatArea(m2) {
+      if (!isFinite(m2) || m2 <= 0) return '—';
+      const mu = m2 / 666.67;
+      if (m2 >= 10000) {
+        return (m2 / 10000).toFixed(3) + ' 公顷（约 ' + mu.toFixed(2) + ' 亩）';
+      }
+      return m2.toFixed(1) + ' 平方米（约 ' + mu.toFixed(2) + ' 亩）';
+    }
+
+    function updateUI() {
+      if (isRecording) {
+        stateText.textContent = '记录中';
+      } else if (trackPoints.length > 0) {
+        stateText.textContent = '已结束';
+      } else {
+        stateText.textContent = '未开始';
+      }
+      countText.textContent = trackPoints.length;
+      btnStart.disabled = isRecording;
+      btnStop.disabled = !isRecording;
+      btnClear.disabled = trackPoints.length === 0 && markers.length === 0;
+    }
+
+    function onPosition(data) {
+      const pos = data && data.position;
+      if (!pos) return;
+      const lng = (typeof pos.lng === 'number') ? pos.lng : (pos.getLng && pos.getLng());
+      const lat = (typeof pos.lat === 'number') ? pos.lat : (pos.getLat && pos.getLat());
+      if (typeof lng !== 'number' || typeof lat !== 'number') return;
+
+      // 初次定位成功后，把地图居中到当前位置
+      if (!initialLocated) {
+        initialLocated = true;
+        map.setCenter([lng, lat]);
+        map.setZoom(17);
+      }
+
+      if (!isRecording) return; // 未在记录中，不标点
+
+      trackPoints.push([lng, lat]);
+
+      try {
+        // 标点（小圆点）
+        const marker = new AMap.Marker({
+          position: [lng, lat],
+          content: '<div style="width:10px;height:10px;border-radius:50%;background:#07c160;border:2px solid #fff;box-shadow:0 0 3px rgba(0,0,0,.4);"></div>',
+          offset: [-7, -7],
+        });
+        marker.setMap(map);
+        markers.push(marker);
+
+        // 连线
+        if (!polyline) {
+          polyline = new AMap.Polyline({
+            path: trackPoints.slice(),
+            strokeColor: '#07c160',
+            strokeWeight: 4,
+            strokeOpacity: 0.9,
+          });
+          polyline.setMap(map);
+        } else {
+          polyline.setPath(trackPoints.slice());
+        }
+      } catch (err) {
+        stateText.textContent = '绘制失败：' + (err && err.message ? err.message : err);
+      }
+
+      // 第一个点居中并放大
+      if (trackPoints.length === 1) {
+        map.setCenter([lng, lat]);
+        map.setZoom(18);
+      }
+
+      updateUI();
+    }
+
+    function onError(err) {
+      console.error('定位失败', err);
+      var msg = '未知原因';
+      if (err) {
+        if (typeof err === 'string') msg = err;
+        else if (err.message) msg = err.message;
+        else if (err.info) msg = err.info;
+        else { try { msg = JSON.stringify(err); } catch (e) { msg = String(err); } }
+      }
+      stateText.textContent = '定位失败：' + msg;
+      if (isRecording) {
+        alert('定位失败：' + msg + '，请检查定位权限');
+      }
+    }
+
+    function start() {
+      if (!geolocation) {
+        alert('定位插件加载中，请稍后再试');
+        return;
+      }
+      if (polyline) { polyline.setMap(null); polyline = null; }
+      if (polygon) { polygon.setMap(null); polygon = null; }
+      markers.forEach(function (m) { m.setMap(null); });
+      markers = [];
+      trackPoints = [];
+      areaText.textContent = '—';
+      isRecording = true;
+      geolocation.watchPosition();
+      updateUI();
+    }
+
+    function stop() {
+      if (!isRecording) return;
+      isRecording = false;
+      if (geolocation) geolocation.clearWatch();
+
+      if (trackPoints.length >= 3) {
+        try {
+          if (polygon) { polygon.setMap(null); }
+          polygon = new AMap.Polygon({
+            path: trackPoints.slice(),
+            strokeColor: '#fa5151',
+            strokeWeight: 2,
+            fillColor: '#fa5151',
+            fillOpacity: 0.25,
+          });
+          polygon.setMap(map);
+          const area = calcAreaM2(trackPoints);
+          areaText.textContent = formatArea(area);
+          try { map.setFitView(); } catch (e) { }
+        } catch (err) {
+          stateText.textContent = '绘制失败：' + (err && err.message ? err.message : err);
+        }
+      } else {
+        areaText.textContent = '点数不足（<3），无法计算面积';
+      }
+      updateUI();
+    }
+
+    function clearAll() {
+      if (polyline) { polyline.setMap(null); polyline = null; }
+      if (polygon) { polygon.setMap(null); polygon = null; }
+      markers.forEach(function (m) { m.setMap(null); });
+      markers = [];
+      trackPoints = [];
+      areaText.textContent = '—';
+      isRecording = false;
+      updateUI();
+    }
+
+    AMapLoader.load({
+      key: "d25586c01ab1815c95b0b8f0d9771bc0",
+      version: "2.0",
+    })
+      .then(function (AMap) {
+        map = new AMap.Map('container', { zoom: 16 });
+
+        // 先加载定位插件，再创建实例（2.0 中 Geolocation 需通过 AMap.plugin 加载）
+        AMap.plugin('AMap.Geolocation', function () {
+          geolocation = new AMap.Geolocation({
+            enableHighAccuracy: true,
+            timeout: 10000,
+            maximumAge: 0,
+            convert: true,        // WGS84 -> GCJ-02，与高德地图对齐
+            showButton: false,
+            showMarker: false,
+            showCircle: false,
+            panToLocation: false,
+            zoomToAccuracy: false,
+          });
+          map.addControl(geolocation);
+
+          geolocation.on('complete', onPosition);
+          geolocation.on('error', onError);
+
+          // 页面加载后主动定位一次，让地图显示当前位置
+          geolocation.getCurrentPosition();
+        });
+
+        btnStart.addEventListener('click', start);
+        btnStop.addEventListener('click', stop);
+        btnClear.addEventListener('click', clearAll);
+        updateUI();
+      })
+      .catch(function (e) {
+        console.error(e);
+        var msg = '未知错误';
+        if (typeof e === 'string') msg = e;
+        else if (e && e.message) msg = e.message;
+        else if (e && e.info) msg = e.info;
+        else if (e) { try { msg = JSON.stringify(e); } catch (err) { msg = String(e); } }
+        stateText.textContent = '地图加载失败：' + msg;
+      });
+  </script>
+</body>
+
+</html>
