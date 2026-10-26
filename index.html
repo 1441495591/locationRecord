@@ -111,7 +111,7 @@
   <script src="https://webapi.amap.com/loader.js"></script>
   <script type="text/javascript">
     let map = null;
-    let geolocation = null;
+    let watchId = null;
     let trackPoints = []; // 坐标数组：[[lng, lat], ...]（GCJ-02）
     let markers = [];     // 轨迹点标记
     let polyline = null;  // 轨迹连线
@@ -126,6 +126,35 @@
     const btnStart = document.getElementById('btnStart');
     const btnStop = document.getElementById('btnStop');
     const btnClear = document.getElementById('btnClear');
+
+    // WGS84 -> GCJ02 坐标转换（火星坐标，供高德地图对齐）
+    function wgs84ToGcj02(lng, lat) {
+      const a = 6378245.0;
+      const ee = 0.00669342162296594323;
+      function transformLat(x, y) {
+        let ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+        ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
+        ret += (20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin(y / 3.0 * Math.PI)) * 2.0 / 3.0;
+        ret += (160.0 * Math.sin(y / 12.0 * Math.PI) + 320 * Math.sin(y * Math.PI / 30.0)) * 2.0 / 3.0;
+        return ret;
+      }
+      function transformLng(x, y) {
+        let ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+        ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
+        ret += (20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin(x / 3.0 * Math.PI)) * 2.0 / 3.0;
+        ret += (150.0 * Math.sin(x / 12.0 * Math.PI) + 300.0 * Math.sin(x / 30.0 * Math.PI)) * 2.0 / 3.0;
+        return ret;
+      }
+      const dLat = transformLat(lng - 105.0, lat - 35.0);
+      const dLng = transformLng(lng - 105.0, lat - 35.0);
+      const radLat = lat / 180.0 * Math.PI;
+      let magic = Math.sin(radLat);
+      magic = 1 - ee * magic * magic;
+      const sqrtMagic = Math.sqrt(magic);
+      const dLat2 = (dLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * Math.PI);
+      const dLng2 = (dLng * 180.0) / (a / sqrtMagic * Math.cos(radLat) * Math.PI);
+      return [lng + dLng2, lat + dLat2];
+    }
 
     // 计算多边形面积（平方米）
     function calcAreaM2(coords) {
@@ -172,11 +201,7 @@
       btnClear.disabled = trackPoints.length === 0 && markers.length === 0;
     }
 
-    function onPosition(data) {
-      const pos = data && data.position;
-      if (!pos) return;
-      const lng = (typeof pos.lng === 'number') ? pos.lng : (pos.getLng && pos.getLng());
-      const lat = (typeof pos.lat === 'number') ? pos.lat : (pos.getLat && pos.getLat());
+    function handlePosition(lng, lat) {
       if (typeof lng !== 'number' || typeof lat !== 'number') return;
 
       // 初次定位成功后，把地图居中到当前位置
@@ -242,8 +267,8 @@
     }
 
     function start() {
-      if (!geolocation) {
-        alert('定位插件加载中，请稍后再试');
+      if (!navigator.geolocation) {
+        alert('浏览器不支持定位');
         return;
       }
       if (polyline) { polyline.setMap(null); polyline = null; }
@@ -254,14 +279,25 @@
       areaText.textContent = '—';
       coordText.textContent = '—';
       isRecording = true;
-      geolocation.watchPosition();
+
+      watchId = navigator.geolocation.watchPosition(
+        function (pos) {
+          const gcj = wgs84ToGcj02(pos.coords.longitude, pos.coords.latitude);
+          handlePosition(gcj[0], gcj[1]);
+        },
+        function (err) { onError(err); },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      );
       updateUI();
     }
 
     function stop() {
       if (!isRecording) return;
       isRecording = false;
-      if (geolocation) geolocation.clearWatch();
+      if (watchId != null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
 
       if (trackPoints.length >= 3) {
         try {
@@ -307,27 +343,19 @@
       .then(function (AMap) {
         map = new AMap.Map('container', { zoom: 16 });
 
-        // 先加载定位插件，再创建实例（2.0 中 Geolocation 需通过 AMap.plugin 加载）
-        AMap.plugin('AMap.Geolocation', function () {
-          geolocation = new AMap.Geolocation({
-            enableHighAccuracy: true,
-            timeout: 10000,
-            maximumAge: 0,
-            convert: true,        // WGS84 -> GCJ-02，与高德地图对齐
-            showButton: false,
-            showMarker: false,
-            showCircle: false,
-            panToLocation: false,
-            zoomToAccuracy: false,
-          });
-          map.addControl(geolocation);
-
-          geolocation.on('complete', onPosition);
-          geolocation.on('error', onError);
-
-          // 页面加载后主动定位一次，让地图显示当前位置
-          geolocation.getCurrentPosition();
-        });
+        // 用原生定位 API 初次定位（比高德插件更可靠，能真正持续更新坐标）
+        if (navigator.geolocation) {
+          navigator.geolocation.getCurrentPosition(
+            function (pos) {
+              const gcj = wgs84ToGcj02(pos.coords.longitude, pos.coords.latitude);
+              handlePosition(gcj[0], gcj[1]);
+            },
+            function (err) { onError(err); },
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+          );
+        } else {
+          stateText.textContent = '浏览器不支持定位';
+        }
 
         btnStart.addEventListener('click', start);
         btnStop.addEventListener('click', stop);
